@@ -1,279 +1,207 @@
 using System;
+using System.IO;
 using UnityEngine;
+using UnityEngine.EventSystems;
 
 namespace RainyDayBakery
 {
-    // A self-contained, resolution-independent prototype. No imported art or scene wiring required.
     public sealed class RainyDayGame : MonoBehaviour
     {
-        enum Screen { Menu, Play, Pause, Summary }
-        enum Batch { Empty, Ingredient, Dough, Baking, Bread }
-        Screen screen;
-        Batch batch;
-        int weather, recipe, kneads, served, coins, totalCoins, days;
-        float bakeTime, ambience;
-        string quality = "", message = "";
-        Vector2 mira = new Vector2(410, 460), destination;
-        int pending = -1;
-        bool moving;
-        Texture2D pixel;
-        GUIStyle text, title, small, button;
-        readonly string[] skies = { "RAIN", "FOG", "SUN" };
-        readonly string[] ingredients = { "rain berries", "wild rosemary", "sun lemons" };
-        readonly string[] recipes = { "Berry cloud bun", "Rosemary hearth loaf", "Lemon morning roll" };
-        readonly string[] hints = { "Rain brings sweet berries to the garden.", "Fog wakes the rosemary near the sea.", "Sunshine ripens the little lemon tree." };
-        readonly Vector2[] stops = { new Vector2(730, 505), new Vector2(210, 365), new Vector2(405, 365), new Vector2(568, 495), new Vector2(735, 330) };
-        readonly Color ink = Hex("343e42"), cream = Hex("fff3d7"), teal = Hex("386d69"), peach = Hex("e9ad84");
-        int Order { get { return served % 3; } }
-
+        public BakeryModel model { get; private set; }
+        public BakeryWorld world { get; private set; }
+        public BakeryUI ui { get; private set; }
+        public bool playing { get; private set; }
+        public bool paused { get; private set; }
+        public bool muted { get; private set; }
+        public string SaveStatus { get; private set; }
+        float autosave, refresh;
+        readonly float[] harvestedAt = new float[8];
+        string savePath;
+        AudioSource ambience, chime;
+        AudioClip note;
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Bootstrap()
-        {
-            if (FindObjectOfType<RainyDayGame>() == null)
-                new GameObject("Rainy Day Bakery").AddComponent<RainyDayGame>();
-        }
-        void Awake()
+        { if (FindObjectOfType<RainyDayGame>() == null) new GameObject("Rainy Day Bakery · Game").AddComponent<RainyDayGame>(); }
+        void Start()
         {
             Application.targetFrameRate = 60;
-            totalCoins = PlayerPrefs.GetInt("RainyBakery.Coins", 0);
-            days = PlayerPrefs.GetInt("RainyBakery.Days", 0);
-            pixel = new Texture2D(1, 1);
-            pixel.SetPixel(0, 0, Color.white); pixel.Apply();
-            if (Camera.main == null) new GameObject("Main Camera", typeof(Camera)).tag = "MainCamera";
-            Camera.main.clearFlags = CameraClearFlags.SolidColor;
-            Camera.main.backgroundColor = ink;
+            savePath = Path.Combine(Application.persistentDataPath,"rainy-day-v2.json");
+            model = new BakeryModel(Load());
+            for(int i=0;i<harvestedAt.Length;i++)harvestedAt[i]=-100;
+            if(FindObjectOfType<EventSystem>()==null)new GameObject("UI Event System",typeof(EventSystem),typeof(StandaloneInputModule));
+            world = gameObject.AddComponent<BakeryWorld>(); world.Initialize(); world.arrived = Interact;
+            world.SetWeather((Sky)model.data.sky,model.data.story);
+            ui = gameObject.AddComponent<BakeryUI>(); ui.Initialize(this); ui.ShowMenu();world.SetWeather(Sky.Sun,model.data.story);
+            SetupAudio();
+            Say(1,"Selamat datang, Mira. Ambil bahan di pantry, lalu buka Buku Resep. Kita mulai dari satu roti hangat.");
         }
-        void OnDestroy() { if (pixel != null) Destroy(pixel); }
-        void StartDay()
+        BakerySave Load()
         {
-            batch = Batch.Empty; weather = 0; served = coins = kneads = 0;
-            bakeTime = 0; quality = ""; moving = false; pending = -1;
-            mira = new Vector2(410, 460); screen = Screen.Play;
-            message = "Nami: Welcome, Mira! Pak Aruna would love a berry bun. Visit the garden to begin.";
+            foreach(string path in new[]{savePath,savePath+".bak"})
+            {
+                if(!File.Exists(path))continue;
+                try
+                {
+                    string json=File.ReadAllText(path);
+                    if(!json.Contains("\"version\""))throw new FormatException("Missing save version");
+                    var data=JsonUtility.FromJson<BakerySave>(json);
+                    if(data==null||data.version!=2)throw new FormatException("Unsupported save version");
+                    SaveStatus=path.EndsWith(".bak")?"Cadangan progres dipulihkan":"Progres dimuat"; return data;
+                }
+                catch(Exception ex) when(ex is IOException || ex is ArgumentException || ex is FormatException)
+                { Debug.LogWarning("Cannot load bakery save: "+ex.Message); SaveStatus="Save bermasalah; mencoba cadangan"; }
+            }
+            return new BakerySave {shells=PlayerPrefs.GetInt("RainyBakery.Coins",0),day=PlayerPrefs.GetInt("RainyBakery.Days",0)+1};
         }
+        public void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Application.persistentDataPath);
+                string temporary=savePath+".tmp";
+                File.WriteAllText(temporary,JsonUtility.ToJson(model.data,true));
+                if(File.Exists(savePath))File.Replace(temporary,savePath,savePath+".bak");else File.Move(temporary,savePath);
+                SaveStatus="Progres tersimpan";
+            }
+            catch(Exception ex) when(ex is IOException || ex is UnauthorizedAccessException)
+            { SaveStatus="Gagal menyimpan: periksa izin folder";Debug.LogError(ex); }
+        }
+        public void Begin()
+        { playing=true;paused=false;ui.HideModal();world.CancelWalk();world.SetWeather((Sky)model.data.sky,model.data.story);ui.Refresh();Say(1,model.NextGoal); }
+        public void Pause()
+        { if(!playing)return;paused=!paused;if(paused){Save();ui.ShowPause();}else ui.HideModal(); }
+        public void MainMenu()
+        { Save();playing=false;paused=false;world.CancelWalk();world.SwitchArea(false);world.SetWeather(Sky.Sun,model.data.story);ui.ShowMenu(); }
+        public void SetWeather(int weather)
+        {
+            model.data.sky=weather;world.CancelWalk();world.SetWeather((Sky)weather,model.data.story);Save();ui.Refresh();
+            Say(1,weather==0?"Hujan menyuburkan herba dan blueberry. Warga berteduh di bakery; fermentasi menjadi 12 detik.":weather==1?"Kabut membuka jamur liar di pesisir. Pak Aruna menunggu di mercusuar; bawakan aroma rempah.":"Cerah membuka ladang buah dan dermaga. Pak Aruna berjalan ke dermaga, mencari baguette renyah.");
+        }
+        public void SelectRecipe(int index)
+        {
+            if(!model.Unlocked(index))return;model.data.selectedRecipe=index;ui.HideModal();Save();ui.Refresh();
+            Say(0,"Resep dipilih: "+BakeryModel.Recipes[index].name+". Siapkan bahan, lalu gunakan meja adonan.");
+        }
+        public void Visit(int index)
+        {
+            if(!playing||paused||ui.ModalOpen)return;
+            if(!world.interior&&index==2&&model.data.sky!=2){Say(1,"Ladang masih basah. Pilih cuaca Cerah agar jalurnya terbuka.");return;}
+            if(!world.interior&&index==5&&model.data.sky!=2){Say(1,"Dermaga licin. Kita kembali ke sana saat Cerah.");return;}
+            world.WalkTo(index);
+        }
+        public void Interact(int index)
+        {
+            if(!playing||paused||ui.ModalOpen)return;
+            if(world.interior) Inside(index); else Outside(index);
+            Save();ui.Refresh();
+        }
+        bool Harvest(int index)
+        {
+            if(Time.time-harvestedAt[index]<6){Say(1,"Biarkan tanaman pulih sebentar (6 detik). Kamu boleh menjelajah dulu.");return false;}
+            harvestedAt[index]=Time.time;return true;
+        }
+        void Outside(int index)
+        {
+            switch(index)
+            {
+                case 0:world.SwitchArea(true);world.SetWeather((Sky)model.data.sky,model.data.story);Say(0,"Rumah yang hangat. Pantry di kiri, oven di belakang, etalase di kanan.");break;
+                case 1:
+                    if(Harvest(index)){model.Add("herb",model.data.sky==0?3:1);if(model.data.sky==0)model.Add("blueberry",2);Say(0,model.data.sky==0?"Herba +3, blueberry +2. Hujan membuat kebun hidup.":"Herba +1. Saat hujan, kebun ini memberi lebih banyak.");}break;
+                case 2:
+                    if(model.data.sky!=2){Say(1,"Ladang terbuka saat Cerah.");break;}
+                    if(Harvest(index)){model.Add("fruit",2);model.Add("honey",1);Say(0,"Buah musim +2, madu +1. Sinar matahari terasa manis.");}break;
+                case 3:
+                    if(model.data.sky!=1){Say(1,"Jamur liar baru muncul ketika kabut turun.");break;}
+                    if(Harvest(index)){model.Add("mushroom",2);Say(0,"Jamur liar +2. Cukup untuk membuat roti hangat bagi Aruna.");}break;
+                case 4:
+                    if(model.data.sky!=1){Say(1,"Aruna ada di bakery saat Hujan dan di dermaga saat Cerah. Temui dia di sini saat Kabut.");break;}
+                    Aruna();break;
+                case 5:
+                    if(model.data.sky!=2){Say(1,"Dermaga kembali terbuka saat Cerah.");break;}
+                    if(model.data.stage==WorkStage.Ready){Aruna();break;}
+                    if(model.data.story>=2&&Harvest(index)){model.Add("honey",2);Say(2,"Kunci gudang pesisir ini milikmu. Ambil madu dari kiriman nelayan: +2.");}
+                    else Aruna();break;
+                case 6:
+                    if(model.data.stage!=WorkStage.Empty){Say(1,"Selesaikan adonan atau sajikan rotimu dulu sebelum beristirahat.");break;}
+                    model.data.day++;Say(0,"Hari baru, angin baru. Semua bahan, resep, dan persahabatan tetap bersamamu.");Ping();break;
+                case 7:Hint();break;
+            }
+        }
+        void Inside(int index)
+        {
+            switch(index)
+            {
+                case 0:world.SwitchArea(false);world.SetWeather((Sky)model.data.sky,model.data.story);Say(0,"Mari melihat kabar desa dan mencari bahan musiman.");break;
+                case 1:
+                    foreach(string id in new[]{"flour","egg","butter","milk","cinnamon"})model.Add(id,3);
+                    Say(1,"Pantry terisi: tepung, telur, mentega, susu, kayu manis masing-masing +3. Bahan dasar selalu tersedia.");Ping();break;
+                case 2:
+                    if(model.data.stage==WorkStage.Empty)
+                    {
+                        if(model.Mix(model.data.selectedRecipe))Say(0,"Bahan siap. Klik meja tiga kali lagi untuk melipat dan menguleni.");
+                        else {Say(1,"Bahan belum lengkap. Lihat kebutuhan dan lokasi bahan di Buku Resep.");ui.ShowRecipes();}
+                    }
+                    else if(model.Knead()){Say(0,model.data.stage==WorkStage.Proofing?"Adonan beristirahat. Cuaca saat mencampur menentukan waktu fermentasi.":"Lipat, tekan, tarik napas. Uleni "+model.data.kneads+" / 3.");Ping();}
+                    else Say(1,"Adonanmu sedang diproses. Lihat status di panel kanan.");break;
+                case 3:
+                    if(model.PutInOven())Say(0,"Roti masuk oven. Angkat saat indikator berada di jendela keemasan.");
+                    else if(model.data.stage==WorkStage.Baking){Say(0,model.TakeOut()+"! Bawa ke etalase, atau temui Aruna langsung di desa.");Ping();}
+                    else Say(1,model.data.stage==WorkStage.Proofing?"Tunggu fermentasi selesai sebelum memasukkan adonan.":"Oven membutuhkan adonan yang sudah diuleni dan difermentasi.");break;
+                case 4:Serve(false);break;
+                case 5:Hint();break;
+                case 6:if(model.data.sky==0)Aruna();else Say(1,"Aruna sedang di luar. Kamu tetap bisa melayani warga melalui etalase.");break;
+            }
+        }
+        void Hint()
+        {
+            string destination=model.data.sky==0?"bakery":model.data.sky==1?"mercusuar":"dermaga";
+            Say(1,"Aruna ada di "+destination+". Favorit cuaca ini: "+BakeryModel.Recipes[model.PreferredRecipe].name+". "+model.NextGoal);
+        }
+        void Aruna()
+        {
+            if(model.TalkAruna()){Say(2,"Kabut membuat cahaya mercusuar terasa jauh. Maukah kau membuat roti dari herba dan jamur pesisir? Aku akan membuka gudang madu di dermaga untukmu.");return;}
+            if(model.data.stage==WorkStage.Ready){Serve(true);return;}
+            Say(2,model.data.story>=2?"Sejak roti hangatmu datang, mercusuar tak lagi terasa sepi. Gudang madu di dermaga selalu terbuka untukmu saat cerah.":"Aku suka aroma rempah saat kabut, cinnamon roll saat hujan, dan baguette saat cerah. Tak perlu terburu-buru, Mira.");
+        }
+        void Serve(bool aruna)
+        {
+            int before=model.data.story;int unlockedBefore=UnlockedCount();int reward=model.Serve(aruna);
+            if(reward==0){Say(aruna?2:1,"Kami menunggu dengan senang hati. Panggang roti dulu, lalu bawa ke sini.");return;}
+            string thanks="Terima kasih! Bahkan roti yang tak sempurna punya kehangatannya. +"+reward+" kerang.";
+            if(model.data.story>before)thanks="Roti ini menghangatkan malam di mercusuar. Terima kasih, Mira. Gudang madu dermaga kini terbuka! +"+reward+" kerang.";
+            else if(UnlockedCount()>unlockedBefore)thanks+=" Resep baru terbuka di Buku Resep!";
+            Say(aruna?2:1,thanks);Ping();
+        }
+        int UnlockedCount(){int n=0;for(int i=0;i<8;i++)if(model.Unlocked(i))n++;return n;}
+        public void Say(int who,string message){if(ui!=null)ui.Say(who,message);}
         void Update()
         {
-            ambience += Time.unscaledDeltaTime;
-            if (Input.GetKeyDown(KeyCode.Escape))
+            if(model==null||ui==null)return;
+            if(Input.GetKeyDown(KeyCode.Escape)) {if(ui.ModalOpen&&playing&&!paused)ui.HideModal();else Pause();}
+            bool running=playing&&!paused&&!ui.ModalOpen;
+            world.Simulate(Time.deltaTime,running);
+            if(running)
             {
-                if (screen == Screen.Play) screen = Screen.Pause;
-                else if (screen == Screen.Pause) screen = Screen.Play;
+                WorkStage before=model.data.stage;model.Tick(Time.deltaTime);
+                if(before==WorkStage.Proofing&&model.data.stage==WorkStage.Dough){Say(1,"Fermentasi selesai. Adonan siap masuk oven batu.");Ping();Save();}
+                if((autosave+=Time.deltaTime)>=5){autosave=0;Save();}
             }
-            if (screen != Screen.Play) return;
-            if (batch == Batch.Baking) bakeTime += Time.deltaTime;
-            Vector2 input = new Vector2((Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow) ? 1 : 0) - (Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow) ? 1 : 0),
-                (Input.GetKey(KeyCode.S) || Input.GetKey(KeyCode.DownArrow) ? 1 : 0) - (Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow) ? 1 : 0));
-            if (input.sqrMagnitude > 0)
-            {
-                moving = false; pending = -1; mira += input.normalized * 210 * Time.deltaTime;
-            }
-            else if (moving)
-            {
-                mira = Vector2.MoveTowards(mira, destination, 260 * Time.deltaTime);
-                if (Vector2.Distance(mira, destination) < 2) { moving = false; int action = pending; pending = -1; Interact(action); }
-            }
-            mira.x = Mathf.Clamp(mira.x, 100, 800); mira.y = Mathf.Clamp(mira.y, 310, 565);
-            if (Input.GetKeyDown(KeyCode.E))
-            {
-                int nearest = 0;
-                for (int i = 1; i < stops.Length; i++)
-                    if (Vector2.Distance(mira, stops[i]) < Vector2.Distance(mira, stops[nearest])) nearest = i;
-                if (Vector2.Distance(mira, stops[nearest]) < 100) Interact(nearest);
-                else message = "Walk closer to a station, or click its button to walk there.";
-            }
+            if((refresh+=Time.unscaledDeltaTime)>.2f){refresh=0;ui.RefreshStatus();}
+            if(ambience!=null)ambience.volume=muted?0:!world.interior&&model.data.sky==0?.09f:.025f;
         }
-        void Visit(int station) { destination = stops[station]; pending = station; moving = true; }
-        void Interact(int station)
+        void SetupAudio()
         {
-            if (station == 0)
-            {
-                if (batch != Batch.Empty) { message = "Finish the batch in your basket first. Nothing goes to waste here."; return; }
-                recipe = weather; batch = Batch.Ingredient; kneads = 0;
-                message = "Gathered " + ingredients[recipe] + ". Flour is on the house! Take them to the mixing table.";
-            }
-            else if (station == 1)
-            {
-                if (batch != Batch.Ingredient) { message = "Gather an ingredient in the garden first, then knead it here."; return; }
-                kneads++;
-                if (kneads >= 3) { batch = Batch.Dough; message = "Lovely dough! Take your " + recipes[recipe].ToLowerInvariant() + " to the oven."; }
-                else message = "Fold, press, breathe. Knead " + kneads + "/3. Click the table again.";
-            }
-            else if (station == 2)
-            {
-                if (batch == Batch.Dough) { batch = Batch.Baking; bakeTime = 0; message = "The oven is warm. Take the bread out in the golden window (6–10 seconds)."; }
-                else if (batch == Batch.Baking)
-                {
-                    quality = BakeryRules.Quality(bakeTime); batch = Batch.Bread;
-                    message = quality + " and made with love. Serve your bread at the counter.";
-                }
-                else message = "The oven needs kneaded dough. Gather, then knead at the mixing table.";
-            }
-            else if (station == 3)
-            {
-                if (batch != Batch.Bread) { message = "Pak Aruna: I'll enjoy the view while you bake. No rush!"; return; }
-                int reward = BakeryRules.Reward(recipe, Order, quality);
-                bool match = recipe == Order;
-                coins += reward; served++; batch = Batch.Empty;
-                message = "Pak Aruna: " + (match ? "Just what I hoped for!" : "A lovely surprise. Thank you!") + " +" + reward + " shells.";
-                if (served == 3)
-                {
-                    totalCoins += coins; days++;
-                    PlayerPrefs.SetInt("RainyBakery.Coins", totalCoins); PlayerPrefs.SetInt("RainyBakery.Days", days); PlayerPrefs.Save();
-                    screen = Screen.Summary;
-                }
-                else message += " Next request: " + recipes[Order] + ". Try " + skies[Order].ToLowerInvariant() + " at the weather dial.";
-            }
-            else if (station == 4) message = "Nami: " + hints[weather] + " Aruna wants " + recipes[Order].ToLowerInvariant() + ". Change the sky any time; your gathered ingredient stays the same.";
+            muted=PlayerPrefs.GetInt("RainyBakery.Muted",0)==1;
+            ambience=gameObject.AddComponent<AudioSource>();chime=gameObject.AddComponent<AudioSource>();
+            int rate=22050;float[] noise=new float[rate*4];var rng=new System.Random(29);float value=0;
+            for(int i=0;i<noise.Length;i++){value=value*.94f+((float)rng.NextDouble()*2-1)*.06f;noise[i]=value;}
+            var rainClip=AudioClip.Create("Soft coastal ambience",noise.Length,1,rate,false);rainClip.SetData(noise,0);ambience.clip=rainClip;ambience.loop=true;ambience.Play();
+            float[] tone=new float[rate/3];for(int i=0;i<tone.Length;i++)tone[i]=Mathf.Sin(i*2*Mathf.PI*659.25f/rate)*Mathf.Exp(-i/(float)rate*13)*.15f;
+            note=AudioClip.Create("Warm notification",tone.Length,1,rate,false);note.SetData(tone,0);
         }
-        static Color Hex(string hex) { Color c; ColorUtility.TryParseHtmlString("#" + hex, out c); return c; }
-        void Styles()
-        {
-            if (text != null) return;
-            text = new GUIStyle(GUI.skin.label) { fontSize = 19, wordWrap = true };
-            text.normal.textColor = ink;
-            small = new GUIStyle(text) { fontSize = 14 };
-            title = new GUIStyle(text) { fontSize = 42, fontStyle = FontStyle.Bold };
-            button = new GUIStyle(text) { alignment = TextAnchor.MiddleCenter, fontSize = 17, fontStyle = FontStyle.Bold };
-        }
-        void Box(float x, float y, float w, float h, Color color)
-        { GUI.color = color; GUI.DrawTexture(new Rect(x, y, w, h), pixel); GUI.color = Color.white; }
-        void Label(string value, float x, float y, float w, float h, GUIStyle style = null)
-        { GUI.Label(new Rect(x, y, w, h), value, style ?? text); }
-        bool Button(string value, float x, float y, float w, float h, bool active = false)
-        {
-            Rect rect = new Rect(x, y, w, h);
-            bool hover = rect.Contains(Event.current.mousePosition);
-            Box(x, y + 3, w, h, Hex("294e4c"));
-            Box(x, y, w, h, active ? peach : hover ? Hex("e6d6ac") : cream);
-            return GUI.Button(rect, value, button);
-        }
-        void OnGUI()
-        {
-            Styles();
-            float scale = Mathf.Min(UnityEngine.Screen.width / 1280f, UnityEngine.Screen.height / 800f);
-            GUI.matrix = Matrix4x4.TRS(new Vector3((UnityEngine.Screen.width - 1280 * scale) / 2, (UnityEngine.Screen.height - 800 * scale) / 2, 0), Quaternion.identity, new Vector3(scale, scale, 1));
-            Box(0, 0, 1280, 800, Hex("e9dfc7"));
-            DrawWorld();
-            if (screen == Screen.Menu) { DrawMenu(); return; }
-            DrawHUD();
-            if (screen == Screen.Pause || screen == Screen.Summary) DrawModal();
-        }
-        void DrawWorld()
-        {
-            Color sky = weather == 2 ? Hex("b9d9cc") : weather == 1 ? Hex("b8c7c5") : Hex("99b6be");
-            Box(0, 0, 890, 800, sky);
-            // Coastal horizon, ripples, and distant islands.
-            Box(0, 145, 890, 135, Hex("719e9c"));
-            for (int i = 0; i < 20; i++) Box((i * 123 + ambience * 8) % 890, 161 + i % 5 * 22, 34, 2, Hex("b2cfbf"));
-            Box(605, 123, 148, 25, Hex("76968e")); Box(658, 72, 26, 61, cream); Box(653, 64, 36, 12, teal); Box(665, 81, 12, 15, peach);
-            Box(40, 256, 810, 357, Hex("a7b58d"));
-            Box(85, 307, 735, 270, Hex("d9c8a7"));
-            for (int i = 0; i < 9; i++) Box(95, 325 + i * 29, 710, 1, Hex("cbb996"));
-            // Open-front cottage bakery.
-            Box(102, 170, 500, 151, Hex("f2d5a3"));
-            Box(85, 160, 535, 30, Hex("9b6154")); Box(103, 140, 500, 20, Hex("b27661"));
-            Box(122, 205, 105, 75, teal); Box(131, 212, 87, 60, sky); Box(172, 210, 6, 64, cream); Box(128, 238, 94, 5, cream);
-            Box(477, 205, 105, 75, teal); Box(486, 212, 87, 60, sky); Box(527, 210, 6, 64, cream); Box(483, 238, 94, 5, cream);
-            Label("RAINY DAY", 253, 200, 225, 42, new GUIStyle(title) { fontSize = 30 });
-            Label("B A K E R Y", 270, 243, 200, 28, small);
-            // Mixing table and oven.
-            Box(147, 307, 124, 40, Hex("a97954")); Box(155, 347, 10, 28, teal); Box(250, 347, 10, 28, teal);
-            Box(183, 299, 53, 20, cream); Box(192, 293, 35, 9, peach);
-            Box(353, 287, 106, 68, Hex("7b7770")); Box(369, 303, 74, 39, ink);
-            Box(382, 317, 48, 19, batch == Batch.Baking ? Hex("eeaf62") : Hex("b27854"));
-            // Counter, garden, weather marker.
-            Box(498, 437, 132, 38, Hex("9c7056")); Box(493, 428, 142, 12, cream);
-            Bread(533, 415); Bread(578, 415);
-            Box(668, 405, 130, 64, Hex("88694e"));
-            for (int i = 0; i < 5; i++)
-            {
-                Box(679 + i * 23, 391 + i % 2 * 8, 14, 49, Hex("65876a"));
-                Box(675 + i * 23, 383 + i % 2 * 8, 23, 18, weather == 0 ? Hex("bd7180") : weather == 1 ? Hex("b5b995") : Hex("efcf75"));
-            }
-            Person(735, 305, Hex("90a6a2"), "Nami");
-            Person(564, 552, Hex("d29e6f"), "Pak Aruna");
-            Person(mira.x, mira.y, Hex("b77767"), "Mira");
-            if (batch != Batch.Empty) { Box(mira.x + 17, mira.y - 28, 24, 17, cream); if (batch == Batch.Bread) Bread(mira.x + 19, mira.y - 34); }
-            if (weather == 0)
-                for (int i = 0; i < 65; i++) Box((i * 137) % 875, (i * 71 + ambience * 190) % 610, 1, 11, new Color(.83f, .94f, .95f, .45f));
-            if (weather == 1)
-                for (int i = 0; i < 6; i++) Box((i * 172 + ambience * 13) % 1000 - 130, 150 + i * 69, 260, 30, new Color(.92f, .95f, .91f, .19f));
-            if (screen == Screen.Play)
-            {
-                if (Button("Gather", 675, 470, 120, 30)) Visit(0);
-                if (Button(batch == Batch.Ingredient ? "Knead " + kneads + "/3" : "Mix dough", 150, 371, 123, 30)) Visit(1);
-                if (Button(batch == Batch.Baking ? "Take out" : "Oven", 347, 371, 120, 30)) Visit(2);
-                if (Button("Serve", 504, 480, 120, 30)) Visit(3);
-                if (Button("Ask Nami", 677, 338, 120, 30)) Visit(4);
-            }
-            Box(30, 628, 830, 141, cream);
-            Label("A LITTLE COASTAL KINDNESS", 52, 644, 780, 24, small);
-            Label(screen == Screen.Menu ? "A warm oven. A changeable sky. A place to belong." : message, 52, 678, 780, 80);
-        }
-        void Bread(float x, float y)
-        { Box(x, y + 4, 29, 14, Hex("cb8d50")); Box(x + 4, y, 21, 17, Hex("e9b76a")); Box(x + 8, y + 3, 3, 7, cream); Box(x + 17, y + 3, 3, 7, cream); }
-        void Person(float x, float y, Color coat, string name)
-        {
-            Box(x - 17, y + 4, 35, 7, new Color(0, 0, 0, .13f));
-            Box(x - 10, y - 21, 21, 26, coat); Box(x - 7, y - 17, 14, 17, cream);
-            Box(x - 10, y - 43, 21, 23, Hex("e7ba92")); Box(x - 12, y - 46, 25, 9, Hex("685548"));
-            Box(x - 5, y - 34, 3, 3, ink); Box(x + 4, y - 34, 3, 3, ink);
-            Label(name, x - 43, y + 11, 90, 24, new GUIStyle(small) { alignment = TextAnchor.MiddleCenter });
-        }
-        void DrawMenu()
-        {
-            Box(890, 0, 390, 800, teal);
-            Box(923, 64, 290, 3, peach);
-            GUI.contentColor = cream;
-            var whiteTitle = new GUIStyle(title); whiteTitle.normal.textColor = cream;
-            var whiteText = new GUIStyle(text); whiteText.normal.textColor = cream;
-            Label("Rainy Day\nBakery", 924, 107, 340, 130, whiteTitle);
-            Label("Small joys, fresh from the oven.", 926, 260, 300, 65, whiteText);
-            Label("Become Mira. Change the sky, gather something good, and bake for your seaside neighbors.", 926, 349, 300, 120, whiteText);
-            GUI.contentColor = Color.white;
-            if (Button(days > 0 ? "Open another day" : "Open the bakery", 925, 515, 300, 55)) StartDay();
-            Label("3 orders • no rush • no game over", 925, 594, 310, 30, new GUIStyle(small) { normal = { textColor = cream } });
-            Label("Days shared: " + days + "\nShells earned: " + totalCoins, 925, 662, 300, 65, whiteText);
-        }
-        void DrawHUD()
-        {
-            Box(890, 0, 390, 800, cream);
-            Label("DAY " + (days + 1).ToString("00"), 920, 25, 240, 26, small);
-            Label("The slow life", 918, 57, 330, 55, new GUIStyle(title) { fontSize = 34 });
-            Label(served + " / 3 orders shared     " + coins + " shells", 920, 118, 330, 30);
-            Box(920, 163, 330, 2, peach);
-            Label("01 / CHOOSE THE SKY", 920, 186, 330, 25, small);
-            for (int i = 0; i < 3; i++)
-                if (Button(skies[i], 920 + i * 113, 223, 104, 39, weather == i) && screen == Screen.Play)
-                { weather = i; message = "Nami: " + hints[weather]; }
-            Label(hints[weather], 920, 280, 330, 55, small);
-            Label("02 / TODAY'S REQUEST", 920, 352, 330, 25, small);
-            Label(recipes[Order], 920, 387, 330, 60, new GUIStyle(text) { fontSize = 25, fontStyle = FontStyle.Bold });
-            Label("Pak Aruna • lighthouse keeper", 920, 450, 330, 25, small);
-            Box(920, 490, 330, 2, peach);
-            Label("03 / YOUR BASKET", 920, 512, 330, 25, small);
-            string status = batch == Batch.Empty ? "Empty — visit the garden" : batch == Batch.Ingredient ? ingredients[recipe] + " • knead " + kneads + "/3" : batch == Batch.Dough ? "Dough ready for the oven" : batch == Batch.Baking ? "Baking • " + bakeTime.ToString("0.0") + " seconds" : quality + " " + recipes[recipe];
-            Label(status, 920, 548, 330, 62);
-            if (batch == Batch.Baking)
-            {
-                Box(920, 615, 330, 15, Hex("d8c6a8")); Box(1052, 615, 88, 15, Hex("91b89b"));
-                Box(920 + Mathf.Clamp01(bakeTime / 15) * 326, 610, 4, 25, ink);
-                Label("Soft          Golden (6–10s)          Toasty", 920, 642, 330, 30, small);
-            }
-            else Label("Gather → knead ×3 → bake → serve", 920, 622, 330, 40, small);
-            Label("Click stations to walk & interact.\nOr WASD / arrows + E. Esc pauses.", 920, 698, 335, 52, small);
-            if (screen == Screen.Play && Button("II", 808, 26, 49, 38)) screen = Screen.Pause;
-        }
-        void DrawModal()
-        {
-            Box(0, 0, 1280, 800, new Color(.12f, .20f, .21f, .72f));
-            Box(355, 183, 570, 435, cream);
-            bool summary = screen == Screen.Summary;
-            Label(summary ? "A day well baked." : "A quiet moment.", 393, 223, 500, 65, title);
-            Label(summary ? "Three warm gifts for the village.\nYou earned " + coins + " shells today.\nYour " + totalCoins + " lifetime shells are saved." : "The oven can wait.\nTake all the time you need.", 395, 315, 485, 125);
-            if (Button(summary ? "Bake another day" : "Back to the bakery", 395, 468, 490, 48))
-            { if (summary) StartDay(); else screen = Screen.Play; }
-            if (Button(summary ? "Main menu" : "End day (discard this day)", 395, 539, 490, 40)) { screen = Screen.Menu; moving = false; }
-        }
+        void Ping(){if(!muted&&chime!=null)chime.PlayOneShot(note);}
+        public void ToggleSound(){muted=!muted;PlayerPrefs.SetInt("RainyBakery.Muted",muted?1:0);PlayerPrefs.Save();ui.Refresh();}
+        void OnApplicationPause(bool value){if(value&&model!=null){Save();if(playing&&!paused){paused=true;ui.ShowPause();}}}
+        void OnApplicationQuit(){if(model!=null)Save();}
     }
 }

@@ -8,3 +8,5 @@ UserSettings/
 *.csproj
 *.sln
 .DS_Store
+**/bin/
+**/obj/
