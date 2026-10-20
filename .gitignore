@@ -10,3 +10,4 @@ UserSettings/
 .DS_Store
 **/bin/
 **/obj/
+!Tests/ModelChecks/ModelChecks.csproj
